@@ -1,527 +1,417 @@
-# GLIM Dump フォーマット解説 & 点群確認ツールまとめ
+#!/usr/bin/env python3
+"""
+GLIM Inspector - GLIMダンプデータの確認・可視化ツール
+
+使い方:
+    python3 glim_inspector.py
+    python3 glim_inspector.py --dump ~/ros2_ws/maps/dump_nakaniwa_0522
+"""
+
+# ============================================================
+# 設定（ここだけ変える）
+# ============================================================
+DEFAULT_DUMP = "~/ros2_ws/maps/dump_nakaniwa_0522"
+MAX_DIST     = 50.0   # 上半球フィルタの距離閾値 [m]
+# ============================================================
+
+import argparse
+import os
+import re
+import sys
+import time
+import threading
 
-作成日: 2025-05-28  
-対象データ: `~/ros2_ws/maps/dump_nakaniwa_0522/`
-
----
-
-## 1. GLIMのDumpとは何か
-
-GLIMはLiDAR SLAMライブラリで、走行中に構築したマップを**キーフレーム単位**でdumpディレクトリに保存する。  
-`dump_on_unload: true` を設定しておくと、ノード終了時に自動保存される。
-
-### ディレクトリ構造
-
-```
-dump_nakaniwa_0522/
-├── 000000/          ← キーフレーム0
-├── 000001/          ← キーフレーム1
-├── 000021/          ← キーフレーム21（例）
-│   ├── data.txt              ← ポーズ・メタ情報
-│   ├── points_compact.bin    ← 点群データ（バイナリ）
-│   ├── intensities_compact.bin ← 反射強度（バイナリ）
-│   ├── covs_compact.bin      ← 共分散行列（バイナリ）
-│   └── imu_rate.txt          ← IMUレートログ
-└── 000118/
-```
-
-1フォルダ = 1キーフレーム。キーフレームは一定距離・角度移動したタイミングで生成される。
-
----
-
-## 2. data.txt の構造
-
-1つのキーフレームに**複数のLiDARスキャンフレーム**（`frame_0`〜`frame_N`）が格納されている。
-
-```
-id: 21                      ← キーフレームID
-T_world_origin: [4x4行列]   ← world座標系の原点変換
-T_origin_endpoint_L/R: ...  ← 左右エンドポイント変換
-T_lidar_imu: [4x4行列]      ← LiDAR→IMU変換（固定）
-imu_bias: ...
-frame_id: 2
-num_frames: 15              ← このキーフレームに含まれるスキャン数
-
-frame_0
-  id: 317
-  stamp: 1779444767.449301  ← UNIX時刻 [秒]
-  T_odom_lidar: [4x4行列]   ← odom座標系でのLiDARポーズ
-  T_world_lidar: [4x4行列]  ← world座標系でのLiDARポーズ
-  v_world_imu: [3次元速度]
-
-frame_1
-  ...（以下frame_14まで続く）
-```
-
-### 座標系の注意点
-
-| フィールド | 意味 | 備考 |
-|---|---|---|
-| `T_odom_lidar` | odom座標系でのLiDARポーズ | GPSドリフトなし |
-| `T_world_lidar` | world座標系でのLiDARポーズ | ループ閉合後に更新される |
-| **今回のデータ** | T_odom == T_world | ループ閉合なし or odom=worldの設定 |
-
-**重要**: ループ閉合が行われていないとき、`T_odom_lidar` と `T_world_lidar` は同じ値になる。
-
----
-
-## 3. points_compact.bin の構造
-
-### フォーマット
-
-```
-dtype  : float32（4 bytes/要素）
-構造   : [x0, y0, z0, x1, y1, z1, ...]
-reshape: np.fromfile(..., dtype=np.float32).reshape(-1, 3)
-```
-
-### 座標系：**LiDARローカル座標**
-
-- 原点 = そのフレームのLiDARセンサ位置
-- X/Y/Z軸 = LiDARセンサの向き
-- **world座標ではない** → world座標に変換するには `T_world_lidar` を使う
-
-```python
-# world座標への変換
-pts_local = np.fromfile("points_compact.bin", dtype=np.float32).reshape(-1, 3)
-pts_h = np.hstack([pts_local, np.ones((len(pts_local), 1))])  # homogeneous
-pts_world = (T_world_lidar @ pts_h.T).T[:, :3]
-```
-
-### 実データの統計（キーフレーム000021）
-
-| 項目 | 値 |
-|---|---|
-| 点数 | 50,477点 |
-| ファイルサイズ | 592 KB |
-| X範囲 | -71.3 〜 +59.4 m |
-| Y範囲 | -80.4 〜 +75.1 m |
-| Z範囲 | -0.95 〜 +49.1 m |
-| 上半球(Z>0)点数 | 32,439点 (64%) |
-| 最大距離 | 約95 m |
-
-### なぜ最大95mもあるのか
-
-GLIMは`num_frames: 15`のように**複数スキャンを統合**して1キーフレームの点群を作る。  
-ロボットが移動しながら取得したスキャンを積み上げるため、見かけ上の点群範囲が広くなる。  
-Livox MID360の公称最大測距は約40mだが、統合後の点群は倍以上の範囲になる。
-
-### 距離分布（キーフレーム000021）
-
-```
-dist < 10m :  8,897点 (17.6%)
-dist < 20m : 20,626点 (40.9%)
-dist < 30m : 35,222点 (69.8%)
-dist < 40m : 45,153点 (89.5%)
-dist < 50m : 49,644点 (98.3%)
-```
-
-**→ MAX_DIST=30mは上半球点の約40%を捨てることになる。50m程度が適切。**
-
----
-
-## 4. 上半球遮蔽率計算における座標変換の誤り（重要）
-
-### バグの内容
-
-`occlusion_analysis.py` の `compute_occlusion_rate()` に座標変換の二重適用バグがある。
-
-```python
-# ❌ 間違い: points_world と命名しているが実際はlidar座標で渡している
-def compute_occlusion_rate(points_world, T_odom_lidar, rays):
-    lidar_pos = T_odom_lidar[:3, 3]
-    dists_world = np.linalg.norm(points_world - lidar_pos, axis=1)  # ← world位置を引いている
-    ...
-    T_inv = np.linalg.inv(T_odom_lidar)
-    pts_lidar = (T_inv @ pts_h.T).T[:, :3]  # ← さらに変換している（二重）
-```
-
-points_compact.bin はすでにLiDAR座標なので、変換は不要。
-
-### 正しい実装
-
-```python
-# ✅ 正しい: lidar座標をそのまま使う
-def compute_occlusion_rate(points_lidar, rays):
-    dists = np.linalg.norm(points_lidar, axis=1)
-    mask = (points_lidar[:, 2] > 0) & (dists < MAX_DIST)
-    pts_upper = points_lidar[mask]
-
-    if len(pts_upper) == 0:
-        return 0.0
-
-    d = np.linalg.norm(pts_upper, axis=1)
-    dirs = pts_upper / d[:, np.newaxis]
-
-    occluded = sum(1 for ray in rays if np.any((dirs @ ray > 0.9962) & (d < MAX_DIST)))
-    return occluded / len(rays)
-```
-
----
-
-## 5. 点群確認ツール
-
-### ツール1: 座標系の判定スクリプト
-
-**目的**: 点群がworld座標かlidar座標かを判定する
-
-```python
-import numpy as np, re
-
-FRAME_DIR = "/home/ubuntu/ros2_ws/maps/dump_nakaniwa_0522/000021"
-
-pts = np.fromfile(f"{FRAME_DIR}/points_compact.bin", dtype=np.float32).reshape(-1, 3)
-print(f"点数: {len(pts)}")
-print(f"X: min={pts[:,0].min():.2f}, max={pts[:,0].max():.2f}, mean={pts[:,0].mean():.2f}")
-print(f"Y: min={pts[:,1].min():.2f}, max={pts[:,1].max():.2f}, mean={pts[:,1].mean():.2f}")
-print(f"Z: min={pts[:,2].min():.2f}, max={pts[:,2].max():.2f}, mean={pts[:,2].mean():.2f}")
-
-with open(f"{FRAME_DIR}/data.txt") as f:
-    content = f.read()
-mat = re.search(
-    r'frame_0.*?T_world_lidar:\s*\n'
-    r'\s*([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s*\n'
-    r'\s*([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s*\n'
-    r'\s*([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s*\n'
-    r'\s*([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)',
-    content, re.DOTALL
-)
-T = np.array([float(v) for v in mat.groups()]).reshape(4,4)
-lidar_pos = T[:3, 3]
-print(f"\nLiDAR world位置: {lidar_pos}")
-print(f"点群centroid:    {pts.mean(axis=0)}")
-print(f"差（小さければlidar座標、大きければworld座標）: {pts.mean(axis=0) - lidar_pos}")
-```
-
-**判定方法**:
-- centroidが原点付近 (0〜数m) → **lidar座標**
-- centroidがLiDAR world位置に近い → world座標
-
----
-
-### ツール2: RViz2で全点群を可視化
-
-**目的**: フレームの点群形状をRViz2でリアルタイム確認
-
-```python
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, PointField
-from std_msgs.msg import Header
-import numpy as np, time
-
-FRAME_DIR = "/home/ubuntu/ros2_ws/maps/dump_nakaniwa_0522/000021"
-
-pts = np.fromfile(f"{FRAME_DIR}/points_compact.bin", dtype=np.float32).reshape(-1, 3)
-
-rclpy.init()
-node = Node("pcd_pub")
-pub = node.create_publisher(PointCloud2, "/debug_points", 10)
-
-msg = PointCloud2()
-msg.header = Header()
-msg.header.frame_id = "map"   # ← Fixed Frameと一致させる
-msg.height = 1
-msg.width = len(pts)
-msg.fields = [
-    PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
-    PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
-    PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
-]
-msg.is_bigendian = False
-msg.point_step = 12
-msg.row_step = 12 * len(pts)
-msg.is_dense = True
-msg.data = pts.astype(np.float32).tobytes()
-
-print(f"点数: {len(pts)}, publish中... (Ctrl+Cで終了)")
-while rclpy.ok():
-    msg.header.stamp = node.get_clock().now().to_msg()
-    pub.publish(msg)
-    time.sleep(1.0)
-```
-
-**RViz2設定**:
-1. `rviz2` を別ターミナルで起動
-2. Fixed Frame → `map`
-3. Add → PointCloud2 → Topic: `/debug_points`
-
----
-
-### ツール3: 上半球フィルタ確認 + RViz2可視化
-
-**目的**: Z>0かつdist<閾値でフィルタ後の点群を確認
-
-```python
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, PointField
-from std_msgs.msg import Header
-import numpy as np, time
-
-FRAME_DIR = "/home/ubuntu/ros2_ws/maps/dump_nakaniwa_0522/000021"
-MAX_DIST = 50.0   # ← ここを変えて試す
-
-pts = np.fromfile(f"{FRAME_DIR}/points_compact.bin", dtype=np.float32).reshape(-1, 3)
-dists = np.linalg.norm(pts, axis=1)
-mask = (pts[:, 2] > 0) & (dists < MAX_DIST)
-pts_upper = pts[mask]
-
-print(f"全点数:   {len(pts)}")
-print(f"上半球内: {len(pts_upper)} ({100*len(pts_upper)/len(pts):.1f}%)")
-print(f"Z>0のみ:  {(pts[:,2]>0).sum()}")
-print(f"dist<{MAX_DIST}m: {(dists<MAX_DIST).sum()}")
-
-rclpy.init()
-node = Node("pcd_upper_pub")
-pub = node.create_publisher(PointCloud2, "/debug_upper", 10)
-
-msg = PointCloud2()
-msg.header = Header()
-msg.header.frame_id = "map"
-msg.height = 1
-msg.width = len(pts_upper)
-msg.fields = [
-    PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-    PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-    PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-]
-msg.is_bigendian = False
-msg.point_step = 12
-msg.row_step = 12 * len(pts_upper)
-msg.is_dense = True
-msg.data = pts_upper.astype(np.float32).tobytes()
-
-print(f"publish中... (Ctrl+Cで終了)")
-while rclpy.ok():
-    msg.header.stamp = node.get_clock().now().to_msg()
-    pub.publish(msg)
-    time.sleep(1.0)
-```
-
-**RViz2設定**: topic `/debug_upper` を追加。`/debug_points` と同時表示して比較できる。
-
----
-
-### ツール4: 距離分布確認スクリプト
-
-**目的**: MAX_DISTの適切な値を決めるための統計確認
-
-```python
 import numpy as np
 
-FRAME_DIR = "/home/ubuntu/ros2_ws/maps/dump_nakaniwa_0522/000021"
 
-pts = np.fromfile(f"{FRAME_DIR}/points_compact.bin", dtype=np.float32).reshape(-1, 3)
-dists = np.linalg.norm(pts, axis=1)
+# ============================================================
+# ユーティリティ
+# ============================================================
 
-print(f"全点数: {len(pts)}")
-print(f"距離: min={dists.min():.1f}m, max={dists.max():.1f}m, mean={dists.mean():.1f}m")
+def get_folders(dump_dir):
+    return sorted([
+        f for f in os.listdir(dump_dir)
+        if re.match(r'^\d{6}$', f) and os.path.isdir(os.path.join(dump_dir, f))
+    ])
 
-# 上半球かつ遠距離の点
-mask_far_upper = (pts[:, 2] > 0) & (dists >= 30.0)
-pts_far = pts[mask_far_upper]
-print(f"\n上半球かつ30m以上: {len(pts_far)}点")
-print(f"  Z平均: {pts_far[:,2].mean():.2f}m  ← 建物上部などが含まれている")
 
-# 閾値別の点数
-print("\n閾値別・累積点数:")
-for d in [10, 20, 30, 40, 50, 60, 80, 100]:
-    n = (dists < d).sum()
-    print(f"  dist < {d:3d}m: {n:6d}点 ({100*n/len(pts):.1f}%)")
-```
+def parse_frame0_pose(data_txt):
+    with open(data_txt) as f:
+        content = f.read()
+    mat44 = (
+        r'\s*([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s*\n'
+        r'\s*([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s*\n'
+        r'\s*([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s*\n'
+        r'\s*([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)\s+([\d.e+\-]+)'
+    )
+    m = re.search(r'frame_0.*?T_world_lidar:\s*\n' + mat44, content, re.DOTALL)
+    if not m:
+        return None
+    return np.array([float(v) for v in m.groups()]).reshape(4, 4)
 
----
 
-## 6. 新データ取得時のチェックリスト
+def load_points(dump_dir, folder):
+    return np.fromfile(
+        os.path.join(dump_dir, folder, "points_compact.bin"),
+        dtype=np.float32
+    ).reshape(-1, 3)
 
-新しいdumpデータを使う前に以下を確認する。
 
-```
-□ data.txt の num_frames を確認（何スキャン統合か）
-□ T_odom_lidar と T_world_lidar が同じか異なるか
-  → 異なる場合はループ閉合あり → T_world_lidar を使うべき
-□ points_compact.bin の点数・距離範囲を確認（ツール4）
-□ centroid確認でlidar座標かworld座標かを判定（ツール1）
-□ RViz2で点群形状が正しく見えるか確認（ツール2）
-□ MAX_DIST の値が距離分布に対して適切か確認（ツール4）
-  → 全上半球点の90%以上をカバーできる値を選ぶ
-```
+def make_cloud_msg(pts, frame_id="map"):
+    from sensor_msgs.msg import PointCloud2, PointField
+    from std_msgs.msg import Header
+    msg = PointCloud2()
+    msg.header = Header()
+    msg.header.frame_id = frame_id
+    msg.height = 1
+    msg.width = len(pts)
+    msg.fields = [
+        PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
+    ]
+    msg.is_bigendian = False
+    msg.point_step = 12
+    msg.row_step = 12 * len(pts)
+    msg.is_dense = True
+    msg.data = pts.astype(np.float32).tobytes()
+    return msg
 
----
 
-## 7. オドメトリデータの構造と使い方
+def generate_rviz_config(dump_dir, topics):
+    type_map  = {
+        "PointCloud2": "rviz_default_plugins/PointCloud2",
+        "Path":        "rviz_default_plugins/Path",
+    }
+    color_map = {
+        "/glim_map":     "r: 1.0\n          g: 1.0\n          b: 1.0",
+        "/debug_points": "r: 0.0\n          g: 1.0\n          b: 0.5",
+        "/debug_upper":  "r: 1.0\n          g: 0.8\n          b: 0.0",
+        "/glim_path":    "r: 1.0\n          g: 0.2\n          b: 0.2",
+    }
+    displays = ""
+    for dtype, topic in topics:
+        plugin = type_map.get(dtype, f"rviz_default_plugins/{dtype}")
+        col    = color_map.get(topic, "r: 1.0\n          g: 1.0\n          b: 1.0")
+        extra  = "\n        Color Transformer: AxisColor\n        Axis: Z\n        Size (m): 0.05" \
+                 if dtype == "PointCloud2" else ""
+        displays += f"""
+    - Class: {plugin}
+      Enabled: true
+      Name: {topic}
+      Topic:
+        Value: {topic}
+      Color:
+        {col}{extra}
+"""
+    dump_name = os.path.basename(dump_dir.rstrip('/'))
+    rviz_path = os.path.join(dump_dir, f"{dump_name}.rviz")
+    with open(rviz_path, 'w') as f:
+        f.write(f"""Visualization Manager:
+  Class: ""
+  Displays:{displays}
+  Enabled: true
+  Global Options:
+    Fixed Frame: map
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+Window Geometry:
+  Height: 900
+  Width: 1400
+""")
+    print(f"RViz設定: {rviz_path}")
+    print(f"起動:     rviz2 -d {rviz_path}\n")
 
-### キーフレーム内での複数フレームの役割
 
-1つのキーフレームには`frame_0`〜`frame_N`（例: 15フレーム）が含まれており、  
-それぞれが**スキャン取得時刻のLiDARポーズ**を持っている。
+# ============================================================
+# フレーム切り替えpublishループ
+# ============================================================
 
-```
-キーフレーム 000021
-├── frame_0  stamp=767.449  T_world_lidar=位置A  ← スキャン時刻のポーズ
-├── frame_1  stamp=767.549  T_world_lidar=位置B  ← 約100ms後
-├── frame_2  stamp=767.649  T_world_lidar=位置C
-...
-└── frame_14 stamp=768.849  T_world_lidar=位置O  ← 1.4秒後
-```
+def interactive_publish(dump_dir, folders, start_idx, build_msgs_fn):
+    """
+    build_msgs_fn(node, idx) -> [(publisher, cloud_msg), ...]
+    publishしながら [n]/[p]/数字 でフレームを切り替える
+    """
+    import rclpy
 
-**点群との対応**: `points_compact.bin` の点群は、これら15フレーム分のスキャンを  
-それぞれの`T_world_lidar`でworld座標に変換・統合したもの。  
-これが点群の見かけ範囲が最大95mになる理由。
+    rclpy.init()
+    node = rclpy.create_node("glim_interactive_pub")
 
-```
-lidar座標の点  →  T_world_lidar(frame_i) で変換  →  world座標に積み上げ
-```
+    state = {
+        "idx":  start_idx,
+        "msgs": build_msgs_fn(node, start_idx),
+        "stop": False,
+    }
 
-### どのポーズを使うべきか
+    def publish_worker():
+        while not state["stop"] and rclpy.ok():
+            now = node.get_clock().now().to_msg()
+            for pub, msg in state["msgs"]:
+                msg.header.stamp = now
+                pub.publish(msg)
+            time.sleep(0.5)
 
-| 用途 | 使うべきポーズ |
-|---|---|
-| 遮蔽率計算（lidar座標の点群に対して） | そのまま使う（変換不要） |
-| world座標での位置を知りたい | frame_0の`T_world_lidar[:3,3]` |
-| 点群をworld座標に変換したい | 各フレームの`T_world_lidar` |
-| GPS誤差との比較 | frame_0の`stamp`と`T_world_lidar` |
+    t = threading.Thread(target=publish_worker, daemon=True)
+    t.start()
 
-### T_odom_lidar と T_world_lidar の違い
+    print("publish開始 — rviz2 を別ターミナルで起動してください")
+    while True:
+        folder = folders[state["idx"]]
+        print(f"\n現在: [{state['idx']:3d}] {folder}   "
+              f"[n]次  [p]前  [数字]直接指定  [q]終了")
+        cmd = input("> ").strip().lower()
 
-```
-T_odom_lidar  : ループ閉合前のオドメトリベースのポーズ
-T_world_lidar : ループ閉合後に補正されたポーズ（推奨）
+        if cmd == 'q':
+            state["stop"] = True
+            break
+        elif cmd == 'n':
+            new_idx = min(state["idx"] + 1, len(folders) - 1)
+        elif cmd == 'p':
+            new_idx = max(state["idx"] - 1, 0)
+        elif cmd.isdigit() and 0 <= int(cmd) < len(folders):
+            new_idx = int(cmd)
+        else:
+            print("無効な入力")
+            continue
 
-今回のデータ: 両者が同じ値 → ループ閉合なし or GLIM設定でodom=world
-```
+        state["idx"]  = new_idx
+        state["msgs"] = build_msgs_fn(node, new_idx)
+        print(f"→ フレーム {folders[new_idx]} に切り替え")
 
----
+    rclpy.shutdown()
 
-## 8. 全軌跡の可視化
 
-### 実データで確認した軌跡情報（dump_nakaniwa_0522）
+# ============================================================
+# 各メニュー機能
+# ============================================================
 
-| 項目 | 値 |
-|---|---|
-| 総キーフレーム数 | 119 |
-| 総移動距離 | 223.6 m |
-| X範囲 | -2.4 〜 54.0 m |
-| Y範囲 | -4.9 〜 55.0 m |
-| Z範囲 | -1.6 〜 0.0 m（ほぼ平坦） |
+def menu_summary(dump_dir, folders):
+    print(f"\n--- データ概要: {os.path.basename(dump_dir)} ---")
+    positions, total_pts = [], 0
+    for folder in folders:
+        T = parse_frame0_pose(os.path.join(dump_dir, folder, "data.txt"))
+        if T is not None:
+            positions.append(T[:3, 3])
+        pts_bin = os.path.join(dump_dir, folder, "points_compact.bin")
+        if os.path.exists(pts_bin):
+            total_pts += os.path.getsize(pts_bin) // 12
+    positions = np.array(positions)
+    travel = np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1))
+    print(f"総キーフレーム数: {len(folders)}")
+    print(f"取得ポーズ数:     {len(positions)}")
+    print(f"総移動距離:       {travel:.1f} m")
+    print(f"X範囲: {positions[:,0].min():.1f} 〜 {positions[:,0].max():.1f} m")
+    print(f"Y範囲: {positions[:,1].min():.1f} 〜 {positions[:,1].max():.1f} m")
+    print(f"Z範囲: {positions[:,2].min():.1f} 〜 {positions[:,2].max():.1f} m")
+    print(f"総点数（概算）:   {total_pts:,} 点")
 
-### RViz2での全軌跡表示
 
-`/glim_path`（Path）と `/glim_map`（PointCloud2）を同時publishする。  
-点群はworld座標に変換してから積み上げる必要がある。
+def menu_coord_check(dump_dir, folders, frame_idx):
+    folder    = folders[frame_idx]
+    pts       = load_points(dump_dir, folder)
+    T         = parse_frame0_pose(os.path.join(dump_dir, folder, "data.txt"))
+    lidar_pos = T[:3, 3]
+    centroid  = pts.mean(axis=0)
+    diff      = np.linalg.norm(centroid - lidar_pos)
+    print(f"\n--- 座標系判定: {folder} ---")
+    print(f"点数:            {len(pts)}")
+    print(f"点群centroid:    {centroid.round(2)}")
+    print(f"LiDAR world位置: {lidar_pos.round(2)}")
+    print(f"差（ノルム）:    {diff:.2f} m")
+    print("→ LiDARローカル座標（正常）" if diff < 5.0 else "→ world座標の可能性あり（要確認）")
 
-```python
-# world座標への変換（全キーフレーム分）
-pts_h = np.hstack([pts_lidar, np.ones((len(pts_lidar), 1))])
-pts_world = (T_world_lidar @ pts_h.T).T[:, :3]
-```
 
-**間引きの目安:**
+def menu_dist_stats(dump_dir, folders, frame_idx):
+    folder = folders[frame_idx]
+    pts    = load_points(dump_dir, folder)
+    dists  = np.linalg.norm(pts, axis=1)
+    upper  = (pts[:,2] > 0).sum()
+    print(f"\n--- 距離分布: {folder} ---")
+    print(f"全点数: {len(pts)}  max={dists.max():.1f}m  mean={dists.mean():.1f}m\n")
+    for d in [10, 20, 30, 40, 50, 60, 80, 100]:
+        n   = (dists < d).sum()
+        bar = '█' * int(30 * n / len(pts))
+        print(f"  dist < {d:3d}m: {n:6d}点 ({100*n/len(pts):5.1f}%) {bar}")
+    print(f"\n上半球(Z>0)={upper}点 に対するMAX_DIST別カバー率:")
+    for d in [30, 40, 50, 60]:
+        n    = ((pts[:,2] > 0) & (dists < d)).sum()
+        mark = " ← 現在の設定" if d == MAX_DIST else ""
+        print(f"  MAX_DIST={d}m: {100*n/upper:.1f}%{mark}")
 
-| キーフレーム間引き | 点群間引き | 表示点数 | 動作の軽さ |
-|---|---|---|---|
-| 1（全部） | 5 | 約100万点 | 重い |
-| 3 | 10 | 約17万点 | 普通 |
-| 5 | 20 | 約5万点 | 軽い |
 
----
+def menu_frame_rviz(dump_dir, folders, start_idx):
+    """[3] 点群 → RViz（全点 + 上半球、フレーム切り替えあり）"""
+    from sensor_msgs.msg import PointCloud2
 
-## 9. GLIM Inspector（統合ツール）
+    print(f"MAX_DIST = {MAX_DIST} m（変更はスクリプト冒頭の設定を編集）")
+    generate_rviz_config(dump_dir, [
+        ("PointCloud2", "/debug_points"),
+        ("PointCloud2", "/debug_upper"),
+    ])
+    print("RViz2 でトピックのチェックを切り替えて表示を選択してください")
+    print(f"  /debug_points : 全点群")
+    print(f"  /debug_upper  : 上半球(Z>0, dist<{MAX_DIST}m)のみ\n")
 
-### 概要
+    pubs = {}
 
-上記の確認作業をすべて1ファイルにまとめた対話型ツール。  
-毎回スクリプトをコピペする必要がなくなる。
+    def build_msgs(node, idx):
+        if "all" not in pubs:
+            pubs["all"]   = node.create_publisher(PointCloud2, "/debug_points", 10)
+            pubs["upper"] = node.create_publisher(PointCloud2, "/debug_upper",  10)
+        pts   = load_points(dump_dir, folders[idx])
+        dists = np.linalg.norm(pts, axis=1)
+        upper = pts[(pts[:,2] > 0) & (dists < MAX_DIST)]
+        print(f"  全{len(pts):,}点 / 上半球{len(upper):,}点 ({100*len(upper)/len(pts):.1f}%)")
+        return [
+            (pubs["all"],   make_cloud_msg(pts)),
+            (pubs["upper"], make_cloud_msg(upper)),
+        ]
 
-### 使い方
+    interactive_publish(dump_dir, folders, start_idx, build_msgs)
 
-```bash
-# デフォルトdumpを使う
-python3 glim_inspector.py
 
-# dumpを指定
-python3 glim_inspector.py --dump ~/ros2_ws/maps/dump_nakaniwa_0522
+def menu_full_map_rviz(dump_dir, folders):
+    """[4] 全軌跡 + マップ → RViz"""
+    import rclpy
+    from nav_msgs.msg import Path
+    from geometry_msgs.msg import PoseStamped
+    from sensor_msgs.msg import PointCloud2
+    from std_msgs.msg import Header
 
-# フレーム番号をあらかじめ固定
-python3 glim_inspector.py --dump ~/ros2_ws/maps/dump_next_run --frame 42
-```
+    stride_kf  = int(input("キーフレーム間引き (デフォルト3): ").strip() or "3")
+    stride_pts = int(input("点群間引き        (デフォルト10): ").strip() or "10")
 
-### メニュー一覧
+    print("データ読み込み中...")
+    all_poses, all_pts_world = [], []
 
-```
-[1] データ概要確認       点数・移動距離・XYZ範囲を一覧表示
-[2] 座標系判定           centroid vs LiDAR world位置でlidar/world座標を判定
-[3] 単フレーム点群→RViz  1フレームをRViz2でpublish
-[4] 上半球フィルタ→RViz  全点群と上半球フィルタ後を同時publish・比較
-[5] 全軌跡+マップ→RViz   /glim_path（軌跡）+ /glim_map（点群）を同時publish
-[6] 距離分布確認         MAX_DIST選定のためのヒストグラム表示
-```
+    for folder in folders:
+        T = parse_frame0_pose(os.path.join(dump_dir, folder, "data.txt"))
+        if T is not None:
+            all_poses.append((folder, T))
 
-### フレーム選択（2/3/4/6で共通）
+    for i, (folder, T) in enumerate(all_poses):
+        if i % stride_kf != 0:
+            continue
+        pts_bin = os.path.join(dump_dir, folder, "points_compact.bin")
+        if not os.path.exists(pts_bin):
+            continue
+        pts   = np.fromfile(pts_bin, dtype=np.float32).reshape(-1, 3)[::stride_pts]
+        pts_h = np.hstack([pts, np.ones((len(pts), 1))])
+        all_pts_world.append((T @ pts_h.T).T[:, :3].astype(np.float32))
 
-```
-[a] 最初のフレーム
-[m] 中間のフレーム
-[e] 最後のフレーム
-数字入力で直接指定（0〜N-1）
-```
+    all_pts_world = np.vstack(all_pts_world)
+    print(f"表示点数: {len(all_pts_world):,}")
 
-### RViz設定ファイルの自動生成
+    generate_rviz_config(dump_dir, [
+        ("PointCloud2", "/glim_map"),
+        ("Path",        "/glim_path"),
+    ])
 
-RVizを起動する機能（3/4/5）を選ぶと、dumpディレクトリ内に`.rviz`ファイルが自動生成される。
+    path_msg = Path()
+    path_msg.header = Header()
+    path_msg.header.frame_id = "map"
+    for _, T in all_poses:
+        ps = PoseStamped()
+        ps.header.frame_id = "map"
+        ps.pose.position.x = float(T[0, 3])
+        ps.pose.position.y = float(T[1, 3])
+        ps.pose.position.z = float(T[2, 3])
+        ps.pose.orientation.w = 1.0
+        path_msg.poses.append(ps)
 
-```bash
-# 生成されるファイル例
-~/ros2_ws/maps/dump_nakaniwa_0522/dump_nakaniwa_0522.rviz
+    cloud_msg = make_cloud_msg(all_pts_world)
 
-# 次回からこれで一発起動
-rviz2 -d ~/ros2_ws/maps/dump_nakaniwa_0522/dump_nakaniwa_0522.rviz
-```
+    rclpy.init()
+    node     = rclpy.create_node("glim_map_pub")
+    pub_map  = node.create_publisher(PointCloud2, "/glim_map",  10)
+    pub_path = node.create_publisher(Path,        "/glim_path", 10)
 
-RViz2のSave Configとは**完全に独立したファイル**なのでRViz2の設定を汚さない。  
-dumpごとに別の`.rviz`ファイルが生成されるので管理しやすい。
+    print("publish中... (Ctrl+C で終了)")
+    while rclpy.ok():
+        now = node.get_clock().now().to_msg()
+        cloud_msg.header.stamp = now
+        path_msg.header.stamp  = now
+        pub_map.publish(cloud_msg)
+        pub_path.publish(path_msg)
+        time.sleep(1.0)
 
-### 新しいdumpが来たときの手順
 
-```bash
-# 1. 概要確認（[1]）
-python3 glim_inspector.py --dump ~/ros2_ws/maps/dump_newrun_MMDD
+# ============================================================
+# フレーム選択
+# ============================================================
 
-# 2. 座標系確認（[2]）→ lidar座標であることを確認
+def select_frame(folders):
+    print(f"\nフレーム選択 (総数: {len(folders)}):")
+    print(f"  [a] 最初  ({folders[0]})")
+    print(f"  [m] 中間  ({folders[len(folders)//2]})")
+    print(f"  [e] 最後  ({folders[-1]})")
+    print(f"  数字で直接指定 (0 〜 {len(folders)-1})")
+    choice = input("選択 > ").strip().lower()
+    if choice == 'a':
+        return 0
+    elif choice == 'm':
+        return len(folders) // 2
+    elif choice == 'e':
+        return len(folders) - 1
+    elif choice.isdigit() and 0 <= int(choice) < len(folders):
+        return int(choice)
+    else:
+        print("無効な入力。最初のフレームを使用")
+        return 0
 
-# 3. 距離分布確認（[6]）→ MAX_DISTの適切な値を決める
 
-# 4. 全軌跡表示（[5]）→ 走行パスに問題ないか目視確認
+# ============================================================
+# メインメニュー
+# ============================================================
 
-# 5. occlusion_analysis.py を実行
-python3 occlusion_analysis.py  # DUMP_DIRを変更してから
-```
+def main():
+    parser = argparse.ArgumentParser(description="GLIM Dump Inspector")
+    parser.add_argument('--dump', default=os.path.expanduser(DEFAULT_DUMP))
+    args = parser.parse_args()
 
-### 出力ファイルの管理
+    dump_dir = os.path.expanduser(args.dump)
+    if not os.path.isdir(dump_dir):
+        print(f"エラー: {dump_dir} が見つかりません")
+        sys.exit(1)
 
-occlusion_analysis.pyの出力CSVはdump名・日時付きで管理する：
+    folders = get_folders(dump_dir)
+    if not folders:
+        print("キーフレームが見つかりません")
+        sys.exit(1)
 
-```
-~/ros2_ws/maps/
-├── dump_nakaniwa_0522/
-│   ├── 000000/ 〜 000118/
-│   ├── dump_nakaniwa_0522.rviz     ← Inspector自動生成
-│   └── occlusion_nakaniwa_0522.csv ← 解析結果
-├── dump_next_run_0601/
-│   ├── ...
-│   ├── dump_next_run_0601.rviz
-│   └── occlusion_next_run_0601.csv
-```
+    while True:
+        print(f"""
+=== GLIM Inspector ===
+DUMP    : {dump_dir}
+フレーム: {len(folders)} 個 ({folders[0]} 〜 {folders[-1]})
+MAX_DIST: {MAX_DIST} m  （変更はスクリプト冒頭）
 
----
+  [1] データ概要確認
+  [2] 座標系判定
+  [3] 点群 → RViz  (/debug_points + /debug_upper)  ← フレーム切り替えあり
+  [4] 全軌跡 + マップ → RViz (/glim_path + /glim_map)
+  [5] 距離分布確認
+  [q] 終了
+""")
+        choice = input("選択 > ").strip().lower()
 
-## 10. よくある問題と対処
+        if choice == 'q':
+            print("終了")
+            break
+        elif choice == '1':
+            menu_summary(dump_dir, folders)
+        elif choice == '2':
+            menu_coord_check(dump_dir, folders, select_frame(folders))
+        elif choice == '3':
+            menu_frame_rviz(dump_dir, folders, select_frame(folders))
+        elif choice == '4':
+            menu_full_map_rviz(dump_dir, folders)
+        elif choice == '5':
+            menu_dist_stats(dump_dir, folders, select_frame(folders))
+        else:
+            print("無効な入力です")
 
-| 問題 | 原因 | 対処 |
-|---|---|---|
-| 遮蔽率が異常に低い/高い | 座標変換の二重適用 | points_compact.binはlidar座標なのでT_inv変換不要 |
-| 遮蔽率が全フレームで低い | MAX_DISTが小さすぎ | 距離分布を確認して50m程度に変更 |
-| parse_data_txtがNoneを返す | stampのフォーマット違い | frame_0のstampを正規表現で取得しているか確認 |
-| RViz2で点群が見えない | Fixed Frameが合っていない | `map`に設定する |
-| T_odom==T_world | ループ閉合なし or GLIM設定 | 研究用途では問題なし（odom精度で評価） |
+
+if __name__ == '__main__':
+    main()
