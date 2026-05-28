@@ -350,7 +350,173 @@ for d in [10, 20, 30, 40, 50, 60, 80, 100]:
 
 ---
 
-## 7. よくある問題と対処
+## 7. オドメトリデータの構造と使い方
+
+### キーフレーム内での複数フレームの役割
+
+1つのキーフレームには`frame_0`〜`frame_N`（例: 15フレーム）が含まれており、  
+それぞれが**スキャン取得時刻のLiDARポーズ**を持っている。
+
+```
+キーフレーム 000021
+├── frame_0  stamp=767.449  T_world_lidar=位置A  ← スキャン時刻のポーズ
+├── frame_1  stamp=767.549  T_world_lidar=位置B  ← 約100ms後
+├── frame_2  stamp=767.649  T_world_lidar=位置C
+...
+└── frame_14 stamp=768.849  T_world_lidar=位置O  ← 1.4秒後
+```
+
+**点群との対応**: `points_compact.bin` の点群は、これら15フレーム分のスキャンを  
+それぞれの`T_world_lidar`でworld座標に変換・統合したもの。  
+これが点群の見かけ範囲が最大95mになる理由。
+
+```
+lidar座標の点  →  T_world_lidar(frame_i) で変換  →  world座標に積み上げ
+```
+
+### どのポーズを使うべきか
+
+| 用途 | 使うべきポーズ |
+|---|---|
+| 遮蔽率計算（lidar座標の点群に対して） | そのまま使う（変換不要） |
+| world座標での位置を知りたい | frame_0の`T_world_lidar[:3,3]` |
+| 点群をworld座標に変換したい | 各フレームの`T_world_lidar` |
+| GPS誤差との比較 | frame_0の`stamp`と`T_world_lidar` |
+
+### T_odom_lidar と T_world_lidar の違い
+
+```
+T_odom_lidar  : ループ閉合前のオドメトリベースのポーズ
+T_world_lidar : ループ閉合後に補正されたポーズ（推奨）
+
+今回のデータ: 両者が同じ値 → ループ閉合なし or GLIM設定でodom=world
+```
+
+---
+
+## 8. 全軌跡の可視化
+
+### 実データで確認した軌跡情報（dump_nakaniwa_0522）
+
+| 項目 | 値 |
+|---|---|
+| 総キーフレーム数 | 119 |
+| 総移動距離 | 223.6 m |
+| X範囲 | -2.4 〜 54.0 m |
+| Y範囲 | -4.9 〜 55.0 m |
+| Z範囲 | -1.6 〜 0.0 m（ほぼ平坦） |
+
+### RViz2での全軌跡表示
+
+`/glim_path`（Path）と `/glim_map`（PointCloud2）を同時publishする。  
+点群はworld座標に変換してから積み上げる必要がある。
+
+```python
+# world座標への変換（全キーフレーム分）
+pts_h = np.hstack([pts_lidar, np.ones((len(pts_lidar), 1))])
+pts_world = (T_world_lidar @ pts_h.T).T[:, :3]
+```
+
+**間引きの目安:**
+
+| キーフレーム間引き | 点群間引き | 表示点数 | 動作の軽さ |
+|---|---|---|---|
+| 1（全部） | 5 | 約100万点 | 重い |
+| 3 | 10 | 約17万点 | 普通 |
+| 5 | 20 | 約5万点 | 軽い |
+
+---
+
+## 9. GLIM Inspector（統合ツール）
+
+### 概要
+
+上記の確認作業をすべて1ファイルにまとめた対話型ツール。  
+毎回スクリプトをコピペする必要がなくなる。
+
+### 使い方
+
+```bash
+# デフォルトdumpを使う
+python3 glim_inspector.py
+
+# dumpを指定
+python3 glim_inspector.py --dump ~/ros2_ws/maps/dump_nakaniwa_0522
+
+# フレーム番号をあらかじめ固定
+python3 glim_inspector.py --dump ~/ros2_ws/maps/dump_next_run --frame 42
+```
+
+### メニュー一覧
+
+```
+[1] データ概要確認       点数・移動距離・XYZ範囲を一覧表示
+[2] 座標系判定           centroid vs LiDAR world位置でlidar/world座標を判定
+[3] 単フレーム点群→RViz  1フレームをRViz2でpublish
+[4] 上半球フィルタ→RViz  全点群と上半球フィルタ後を同時publish・比較
+[5] 全軌跡+マップ→RViz   /glim_path（軌跡）+ /glim_map（点群）を同時publish
+[6] 距離分布確認         MAX_DIST選定のためのヒストグラム表示
+```
+
+### フレーム選択（2/3/4/6で共通）
+
+```
+[a] 最初のフレーム
+[m] 中間のフレーム
+[e] 最後のフレーム
+数字入力で直接指定（0〜N-1）
+```
+
+### RViz設定ファイルの自動生成
+
+RVizを起動する機能（3/4/5）を選ぶと、dumpディレクトリ内に`.rviz`ファイルが自動生成される。
+
+```bash
+# 生成されるファイル例
+~/ros2_ws/maps/dump_nakaniwa_0522/dump_nakaniwa_0522.rviz
+
+# 次回からこれで一発起動
+rviz2 -d ~/ros2_ws/maps/dump_nakaniwa_0522/dump_nakaniwa_0522.rviz
+```
+
+RViz2のSave Configとは**完全に独立したファイル**なのでRViz2の設定を汚さない。  
+dumpごとに別の`.rviz`ファイルが生成されるので管理しやすい。
+
+### 新しいdumpが来たときの手順
+
+```bash
+# 1. 概要確認（[1]）
+python3 glim_inspector.py --dump ~/ros2_ws/maps/dump_newrun_MMDD
+
+# 2. 座標系確認（[2]）→ lidar座標であることを確認
+
+# 3. 距離分布確認（[6]）→ MAX_DISTの適切な値を決める
+
+# 4. 全軌跡表示（[5]）→ 走行パスに問題ないか目視確認
+
+# 5. occlusion_analysis.py を実行
+python3 occlusion_analysis.py  # DUMP_DIRを変更してから
+```
+
+### 出力ファイルの管理
+
+occlusion_analysis.pyの出力CSVはdump名・日時付きで管理する：
+
+```
+~/ros2_ws/maps/
+├── dump_nakaniwa_0522/
+│   ├── 000000/ 〜 000118/
+│   ├── dump_nakaniwa_0522.rviz     ← Inspector自動生成
+│   └── occlusion_nakaniwa_0522.csv ← 解析結果
+├── dump_next_run_0601/
+│   ├── ...
+│   ├── dump_next_run_0601.rviz
+│   └── occlusion_next_run_0601.csv
+```
+
+---
+
+## 10. よくある問題と対処
 
 | 問題 | 原因 | 対処 |
 |---|---|---|
